@@ -127,3 +127,76 @@ jobs:
         with:
           username: ${{ env.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      # Step 7: Scan tagged image with AWS Inspector
+      - name: Scan final image with AWS Inspector
+        uses: aws-actions/vulnerability-scan-github-action-for-amazon-inspector@v1
+        id: inspector
+        with:
+          artifact_type: 'container'
+          artifact_path: ${{ steps.tag-image.outputs.final_image }}
+          critical_threshold: 1
+          high_threshold: 1
+          medium_threshold: 1
+          low_threshold: 1
+          other_threshold: 1
+          display_vulnerability_findings: enabled
+          output_sbom_path: ./sbom_output.json
+          output_inspector_scan_path: ./inspector_scan_output.json
+          output_inspector_scan_path_csv: ./inspector_scan_output.csv
+          output_inspector_scan_path_markdown: ./inspector_scan_output.md
+
+      # Step 8: Upload scan results (for debugging)
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: |
+            ./trivy-report.json
+            ./sbom_output.json
+            ./inspector_scan_output.json
+            ./inspector_scan_output.csv
+            ./inspector_scan_output.md
+
+      # Step 9: Decision point - Push to Docker Hub or Fail
+      - name: Evaluate Inspector results and push to Docker Hub
+        run: |
+          THRESHOLD_EXCEEDED="${{ steps.inspector.outputs.vulnerability_threshold_exceeded }}"
+          DOCKERHUB_IMAGE="${{ steps.tag-image.outputs.dockerhub_image }}"
+          FINAL_IMAGE="${{ steps.tag-image.outputs.final_image }}"
+          NEEDS_PATCHING="${{ steps.vuln-check.outputs.needs_patching }}"
+          
+          echo "=== SECURITY SCAN RESULTS ==="
+          echo "Original vulnerabilities found: ${{ steps.vuln-check.outputs.vuln_count }}"
+          echo "Patching required: $NEEDS_PATCHING"
+          echo "Final image scanned: $FINAL_IMAGE"
+          echo "AWS Inspector threshold exceeded: $THRESHOLD_EXCEEDED"
+          echo "Docker Hub target: $DOCKERHUB_IMAGE"
+          echo "============================="
+          
+          if [[ "$THRESHOLD_EXCEEDED" == "true" ]]; then
+            echo ""
+            echo "❌ SECURITY SCAN FAILED!"
+            echo "🚫 AWS Inspector detected vulnerabilities above threshold"
+            echo "🛑 Image will NOT be pushed to Docker Hub"
+            echo "📋 Check uploaded scan results for vulnerability details"
+            echo ""
+            exit 1
+          else
+            echo ""
+            echo "✅ SECURITY SCAN PASSED!"
+            echo "🔒 Image meets all security thresholds"
+            echo "🚀 Proceeding to push to Docker Hub..."
+            echo ""
+            
+            # Push to Docker Hub
+            echo "📤 Pushing to Docker Hub: $DOCKERHUB_IMAGE"
+            docker push "$DOCKERHUB_IMAGE"
+            
+            echo ""
+            echo "🎉 SUCCESS! Image pushed to Docker Hub: $DOCKERHUB_IMAGE"
+            echo "🔐 Image has passed all security scans (Copacetic + AWS Inspector)"
+            echo ""
+          fi
+
