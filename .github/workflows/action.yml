@@ -31,9 +31,25 @@ jobs:
       - name: Build Docker image
         id: build
         run: |
-          IMAGE_NAME="${{ inputs.image_name }}"
-          VERSION="${{ inputs.release_version }}"
-          BUILT_IMAGE="$IMAGE_NAME:$VERSION"
+          # Use input or default to 'platform'
+          IMAGE_NAME="${{ inputs.image_name || 'platform' }}"
+          IMAGE_TAG="${{ env.IMAGE_TAG }}"
+          BUILT_IMAGE="$IMAGE_NAME:$IMAGE_TAG"
+          
+          echo "=== BUILD CONFIGURATION ==="
+          echo "Image name: $IMAGE_NAME"
+          echo "Image tag: $IMAGE_TAG"
+          echo "Built image: $BUILT_IMAGE"
+          echo "Build context: $(pwd)"
+          echo "=========================="
+          
+          # Check if Dockerfile exists in root
+          if [[ ! -f "Dockerfile" ]]; then
+            echo "❌ Error: Dockerfile not found in root directory"
+            echo "📁 Root directory contents:"
+            ls -la
+            exit 1
+          fi
           
           echo "🔨 Building image: $BUILT_IMAGE"
           docker build -t "$BUILT_IMAGE" .
