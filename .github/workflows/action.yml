@@ -1,0 +1,108 @@
+
+name: Build, Scan, and Secure Deploy
+on:
+  push:
+    branches: main
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version (format: x-x-x)'
+        required: true
+        type: string
+      image_name:
+        description: 'Image name to build'
+        required: true
+        type: string
+        default: 'platform'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  secure-build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Step 1: Build the image
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        id: build
+        run: |
+          IMAGE_NAME="${{ inputs.image_name }}"
+          VERSION="${{ inputs.release_version }}"
+          BUILT_IMAGE="$IMAGE_NAME:$VERSION"
+          
+          echo "🔨 Building image: $BUILT_IMAGE"
+          docker build -t "$BUILT_IMAGE" .
+          
+          echo "built_image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
+          echo "✅ Image built successfully: $BUILT_IMAGE"
+
+      # Step 2: Scan built image with Copacetic
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: "image"
+          format: "json"
+          output: "trivy-report.json"
+          ignore-unfixed: true
+          vuln-type: "os"
+          image-ref: ${{ steps.build.outputs.built_image }}
+
+      - name: Check vulnerabilities and determine if patching needed
+        id: vuln-check
+        run: |
+          vuln_count=$(jq 'if .Results then [.Results[] | select(.Class=="os-pkgs" and .Vulnerabilities!=null) | .Vulnerabilities[]] | length else 0 end' "trivy-report.json")
+          echo "🔍 Found $vuln_count vulnerabilities in built image"
+          echo "vuln_count=$vuln_count" >> $GITHUB_OUTPUT
+          
+          if [[ "$vuln_count" -gt 0 ]]; then
+            echo "⚠️ Vulnerabilities detected - patching required"
+            echo "needs_patching=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ No vulnerabilities found - no patching needed"
+            echo "needs_patching=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 3: Patch image with Copa if vulnerabilities found
+      - name: Patch image with Copa
+        if: steps.vuln-check.outputs.needs_patching == 'true'
+        id: copa
+        uses: project-copacetic/copa-action@v1.2.1
+        with:
+          image: ${{ steps.build.outputs.built_image }}
+          image-report: "trivy-report.json"
+          patched-tag: ${{ inputs.release_version }}-patched
+
+      # Step 4: Tag the final image (patched or original)
+      - name: Tag final image for scanning
+        id: tag-image
+        run: |
+          ORIGINAL_IMAGE="${{ steps.build.outputs.built_image }}"
+          NEEDS_PATCHING="${{ steps.vuln-check.outputs.needs_patching }}"
+          PATCHED_IMAGE="${{ steps.copa.outputs.patched-image }}"
+          COPA_SUCCESS="${{ steps.copa.conclusion }}"
+          
+          # Determine which image to use for Inspector scan
+          if [[ "$NEEDS_PATCHING" == "true" && "$COPA_SUCCESS" == "success" && "$PATCHED_IMAGE" != "" ]]; then
+            FINAL_IMAGE="$PATCHED_IMAGE"
+            echo "🔧 Using patched image: $FINAL_IMAGE"
+          else
+            FINAL_IMAGE="$ORIGINAL_IMAGE"
+            echo "📦 Using original image: $FINAL_IMAGE"
+          fi
+          
+          # Tag for ECR push (but don't push yet)
+          ECR_IMAGE="${{ env.ECR_REGISTRY }}/${{ inputs.image_name }}:${{ inputs.release_version }}"
+          docker tag "$FINAL_IMAGE" "$ECR_IMAGE"
+          
+          echo "🏷️ Tagged image for ECR: $ECR_IMAGE"
+          echo "final_image=$FINAL_IMAGE" >> $GITHUB_OUTPUT
+          echo "ecr_image=$ECR_IMAGE" >> $GITHUB_OUTPUT
