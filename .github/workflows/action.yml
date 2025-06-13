@@ -27,7 +27,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build Docker image (untagged)
         id: build
         run: |
           IMAGE_NAME="${{ inputs.image_name || 'platform' }}"
@@ -62,8 +62,8 @@ jobs:
           image-report: "trivy-report.json"
           patched-tag: patched
 
-      - name: Tag final image
-        id: tag-image
+      - name: Determine final image for scanning
+        id: final-image
         run: |
           ORIGINAL_IMAGE="${{ steps.build.outputs.built_image }}"
           PATCHED_IMAGE="${{ steps.copa.outputs.patched-image }}"
@@ -74,11 +74,7 @@ jobs:
             FINAL_IMAGE="$ORIGINAL_IMAGE"
           fi
           
-          DOCKERHUB_IMAGE="${{ env.DOCKER_HUB_USERNAME }}/${{ inputs.image_name || 'platform' }}:latest"
-          docker tag "$FINAL_IMAGE" "$DOCKERHUB_IMAGE"
-          
           echo "final_image=$FINAL_IMAGE" >> $GITHUB_OUTPUT
-          echo "dockerhub_image=$DOCKERHUB_IMAGE" >> $GITHUB_OUTPUT
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -86,18 +82,12 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: "arn:aws:iam::908027403160:role/aws-inspector"
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3.3.0
-        with:
-          username: ${{ env.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
       - name: Scan with AWS Inspector
         uses: aws-actions/vulnerability-scan-github-action-for-amazon-inspector@v1
         id: inspector
         with:
           artifact_type: 'container'
-          artifact_path: ${{ steps.tag-image.outputs.final_image }}
+          artifact_path: ${{ steps.final-image.outputs.final_image }}
           critical_threshold: 1
           high_threshold: 1
           medium_threshold: 1
@@ -117,12 +107,21 @@ jobs:
             ./sbom_output.json
             ./inspector_scan_output.json
 
-      - name: Push to Docker Hub if secure
+      - name: Tag and push to Docker Hub
         run: |
           if [[ "${{ steps.inspector.outputs.vulnerability_threshold_exceeded }}" == "true" ]]; then
             echo "❌ Security scan failed - vulnerabilities exceed threshold"
             exit 1
           fi
           
-          docker push "${{ steps.tag-image.outputs.dockerhub_image }}"
-          echo "✅ Image pushed to Docker Hub: ${{ steps.tag-image.outputs.dockerhub_image }}"
+          # Login to Docker Hub
+          echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ env.DOCKER_HUB_USERNAME }}" --password-stdin
+          
+          # Tag for Docker Hub
+          FINAL_IMAGE="${{ steps.final-image.outputs.final_image }}"
+          DOCKERHUB_IMAGE="${{ env.DOCKER_HUB_USERNAME }}/${{ inputs.image_name || 'platform' }}:latest"
+          docker tag "$FINAL_IMAGE" "$DOCKERHUB_IMAGE"
+          
+          # Push to Docker Hub
+          docker push "$DOCKERHUB_IMAGE"
+          echo "✅ Image pushed to Docker Hub: $DOCKERHUB_IMAGE"
