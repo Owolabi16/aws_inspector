@@ -1,4 +1,3 @@
-
 name: Build, Scan, and Secure Deploy
 on:
   push:
@@ -13,7 +12,6 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  IMAGE_TAG: latest
   DOCKER_HUB_USERNAME: owolabialiu
 
 jobs:
@@ -23,7 +21,6 @@ jobs:
       id-token: write
       contents: read
     steps:
-      # Step 1: Build the image
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -33,18 +30,12 @@ jobs:
       - name: Build Docker image
         id: build
         run: |
-          # Use input or default to 'platform'
           IMAGE_NAME="${{ inputs.image_name || 'platform' }}"
-          IMAGE_TAG="${{ env.IMAGE_TAG }}"
-          BUILT_IMAGE="$IMAGE_NAME:$IMAGE_TAG"
+          BUILT_IMAGE="$IMAGE_NAME:latest"
           
-          echo "🔨 Building image: $BUILT_IMAGE"
           docker build -t "$BUILT_IMAGE" .
-          
           echo "built_image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
-          echo "✅ Image built successfully: $BUILT_IMAGE"
 
-      # Step 2: Scan built image with Copacetic
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@0.29.0
         with:
@@ -55,22 +46,13 @@ jobs:
           vuln-type: "os"
           image-ref: ${{ steps.build.outputs.built_image }}
 
-      - name: Check vulnerabilities and determine if patching needed
+      - name: Check vulnerabilities
         id: vuln-check
         run: |
           vuln_count=$(jq 'if .Results then [.Results[] | select(.Class=="os-pkgs" and .Vulnerabilities!=null) | .Vulnerabilities[]] | length else 0 end' "trivy-report.json")
-          echo "🔍 Found $vuln_count vulnerabilities in built image"
           echo "vuln_count=$vuln_count" >> $GITHUB_OUTPUT
-          
-          if [[ "$vuln_count" -gt 0 ]]; then
-            echo "⚠️ Vulnerabilities detected - patching required"
-            echo "needs_patching=true" >> $GITHUB_OUTPUT
-          else
-            echo "✅ No vulnerabilities found - no patching needed"
-            echo "needs_patching=false" >> $GITHUB_OUTPUT
-          fi
+          echo "needs_patching=$([[ "$vuln_count" -gt 0 ]] && echo true || echo false)" >> $GITHUB_OUTPUT
 
-      # Step 3: Patch image with Copa if vulnerabilities found
       - name: Patch image with Copa
         if: steps.vuln-check.outputs.needs_patching == 'true'
         id: copa
@@ -78,58 +60,39 @@ jobs:
         with:
           image: ${{ steps.build.outputs.built_image }}
           image-report: "trivy-report.json"
-          patched-tag: ${{ inputs.release_version }}-patched
+          patched-tag: patched
 
-      # Step 4: Tag the final image (patched or original)
-      - name: Tag final image for scanning
+      - name: Tag final image
         id: tag-image
         run: |
           ORIGINAL_IMAGE="${{ steps.build.outputs.built_image }}"
-          NEEDS_PATCHING="${{ steps.vuln-check.outputs.needs_patching }}"
           PATCHED_IMAGE="${{ steps.copa.outputs.patched-image }}"
-          COPA_SUCCESS="${{ steps.copa.conclusion }}"
           
-          echo "=== IMAGE SELECTION ==="
-          echo "Original image: $ORIGINAL_IMAGE"
-          echo "Needs patching: $NEEDS_PATCHING"
-          echo "Patched image: $PATCHED_IMAGE"
-          echo "Copa success: $COPA_SUCCESS"
-          echo "======================"
-          
-          # Determine which image to use for Inspector scan
-          if [[ "$NEEDS_PATCHING" == "true" && "$COPA_SUCCESS" == "success" && "$PATCHED_IMAGE" != "" ]]; then
+          if [[ "${{ steps.vuln-check.outputs.needs_patching }}" == "true" && "${{ steps.copa.conclusion }}" == "success" && "$PATCHED_IMAGE" != "" ]]; then
             FINAL_IMAGE="$PATCHED_IMAGE"
-            echo "🔧 Using patched image: $FINAL_IMAGE"
           else
             FINAL_IMAGE="$ORIGINAL_IMAGE"
-            echo "📦 Using original image: $FINAL_IMAGE"
           fi
           
-          # Tag for Docker Hub push (but don't push yet)
           DOCKERHUB_IMAGE="${{ env.DOCKER_HUB_USERNAME }}/${{ inputs.image_name || 'platform' }}:latest"
-          echo "🏷️ Tagging for Docker Hub: $DOCKERHUB_IMAGE"
           docker tag "$FINAL_IMAGE" "$DOCKERHUB_IMAGE"
           
-          echo "🏷️ Tagged image for Docker Hub: $DOCKERHUB_IMAGE"
           echo "final_image=$FINAL_IMAGE" >> $GITHUB_OUTPUT
           echo "dockerhub_image=$DOCKERHUB_IMAGE" >> $GITHUB_OUTPUT
 
-      # Step 5: Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: "arn:aws:iam::908027403160:role/aws-inspector"
 
-      # Step 6: Login to Docker Hub  
       - name: Login to Docker Hub
         uses: docker/login-action@v3.3.0
         with:
           username: ${{ env.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      # Step 7: Scan tagged image with AWS Inspector
-      - name: Scan final image with AWS Inspector
+      - name: Scan with AWS Inspector
         uses: aws-actions/vulnerability-scan-github-action-for-amazon-inspector@v1
         id: inspector
         with:
@@ -143,10 +106,7 @@ jobs:
           display_vulnerability_findings: enabled
           output_sbom_path: ./sbom_output.json
           output_inspector_scan_path: ./inspector_scan_output.json
-          output_inspector_scan_path_csv: ./inspector_scan_output.csv
-          output_inspector_scan_path_markdown: ./inspector_scan_output.md
 
-      # Step 8: Upload scan results (for debugging)
       - name: Upload scan results
         if: always()
         uses: actions/upload-artifact@v4
@@ -156,47 +116,13 @@ jobs:
             ./trivy-report.json
             ./sbom_output.json
             ./inspector_scan_output.json
-            ./inspector_scan_output.csv
-            ./inspector_scan_output.md
 
-      # Step 9: Decision point - Push to Docker Hub or Fail
-      - name: Evaluate Inspector results and push to Docker Hub
+      - name: Push to Docker Hub if secure
         run: |
-          THRESHOLD_EXCEEDED="${{ steps.inspector.outputs.vulnerability_threshold_exceeded }}"
-          DOCKERHUB_IMAGE="${{ steps.tag-image.outputs.dockerhub_image }}"
-          FINAL_IMAGE="${{ steps.tag-image.outputs.final_image }}"
-          NEEDS_PATCHING="${{ steps.vuln-check.outputs.needs_patching }}"
-          
-          echo "=== SECURITY SCAN RESULTS ==="
-          echo "Original vulnerabilities found: ${{ steps.vuln-check.outputs.vuln_count }}"
-          echo "Patching required: $NEEDS_PATCHING"
-          echo "Final image scanned: $FINAL_IMAGE"
-          echo "AWS Inspector threshold exceeded: $THRESHOLD_EXCEEDED"
-          echo "Docker Hub target: $DOCKERHUB_IMAGE"
-          echo "============================="
-          
-          if [[ "$THRESHOLD_EXCEEDED" == "true" ]]; then
-            echo ""
-            echo "❌ SECURITY SCAN FAILED!"
-            echo "🚫 AWS Inspector detected vulnerabilities above threshold"
-            echo "🛑 Image will NOT be pushed to Docker Hub"
-            echo "📋 Check uploaded scan results for vulnerability details"
-            echo ""
+          if [[ "${{ steps.inspector.outputs.vulnerability_threshold_exceeded }}" == "true" ]]; then
+            echo "❌ Security scan failed - vulnerabilities exceed threshold"
             exit 1
-          else
-            echo ""
-            echo "✅ SECURITY SCAN PASSED!"
-            echo "🔒 Image meets all security thresholds"
-            echo "🚀 Proceeding to push to Docker Hub..."
-            echo ""
-            
-            # Push to Docker Hub
-            echo "📤 Pushing to Docker Hub: $DOCKERHUB_IMAGE"
-            docker push "$DOCKERHUB_IMAGE"
-            
-            echo ""
-            echo "🎉 SUCCESS! Image pushed to Docker Hub: $DOCKERHUB_IMAGE"
-            echo "🔐 Image has passed all security scans (Copacetic + AWS Inspector)"
-            echo ""
           fi
-
+          
+          docker push "${{ steps.tag-image.outputs.dockerhub_image }}"
+          echo "✅ Image pushed to Docker Hub: ${{ steps.tag-image.outputs.dockerhub_image }}"
